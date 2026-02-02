@@ -7,6 +7,7 @@
 #include <QUdpSocket>
 #include <QTimer>
 #include <QHostAddress>
+#include <QSet>
 #include "checkersgame.h"
 
 // Message types for network protocol
@@ -114,6 +115,7 @@ private:
     void processMessage(const QByteArray& data);
     void sendMessage(MessageType type, const QByteArray& payload = QByteArray());
     QByteArray createPacket(MessageType type, const QByteArray& payload);
+    void updateLocalAddresses();
     
     // TCP
     QTcpServer* m_server = nullptr;
@@ -136,6 +138,7 @@ private:
     QString m_opponentName;
     PlayerColor m_localColor = PlayerColor::None;
     quint16 m_hostPort = DEFAULT_PORT;
+    QSet<QString> m_localAddresses;
 };
 
 #endif // NETWORKMANAGER_H

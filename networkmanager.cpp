@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDateTime>
+#include <QIODevice>
 
 NetworkManager::NetworkManager(QObject *parent)
     : QObject(parent)
@@ -18,11 +19,24 @@ NetworkManager::NetworkManager(QObject *parent)
     connect(m_discoveryTimer, &QTimer::timeout, this, &NetworkManager::announcePresence);
     connect(m_cleanupTimer, &QTimer::timeout, this, &NetworkManager::cleanupStalePeers);
     connect(m_pingTimer, &QTimer::timeout, this, &NetworkManager::sendPing);
+    
+    // Collect local IP addresses for filtering
+    updateLocalAddresses();
 }
 
 NetworkManager::~NetworkManager()
 {
     disconnect();
+}
+
+void NetworkManager::updateLocalAddresses()
+{
+    m_localAddresses.clear();
+    for (const QNetworkInterface& iface : QNetworkInterface::allInterfaces()) {
+        for (const QNetworkAddressEntry& entry : iface.addressEntries()) {
+            m_localAddresses.insert(entry.ip().toString());
+        }
+    }
 }
 
 QString NetworkManager::getLocalIPAddress()
@@ -63,6 +77,11 @@ bool NetworkManager::hostGame(const QString& playerName, quint16 port)
     
     // Start announcing presence for discovery
     startDiscovery();
+    
+    // Announce immediately multiple times to ensure visibility
+    announcePresence();
+    QTimer::singleShot(500, this, &NetworkManager::announcePresence);
+    QTimer::singleShot(1000, this, &NetworkManager::announcePresence);
     
     return true;
 }
@@ -126,19 +145,38 @@ void NetworkManager::disconnect()
 
 void NetworkManager::startDiscovery()
 {
-    m_discoverySocket->bind(DISCOVERY_PORT, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
+    // Close if already open
+    if (m_discoverySocket->state() != QAbstractSocket::UnconnectedState) {
+        m_discoverySocket->close();
+    }
+    
+    // Bind to discovery port with sharing enabled
+    if (!m_discoverySocket->bind(QHostAddress::Any, DISCOVERY_PORT, 
+                                  QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
+        qWarning() << "Failed to bind discovery socket:" << m_discoverySocket->errorString();
+        // Try without specific port
+        m_discoverySocket->bind(QHostAddress::Any, 0, QUdpSocket::ShareAddress);
+    }
+    
     m_discoveryTimer->start(DISCOVERY_INTERVAL_MS);
     m_cleanupTimer->start(1000);
     
-    // Announce immediately
-    announcePresence();
+    // Update local addresses for filtering
+    updateLocalAddresses();
+    
+    // Announce immediately if hosting
+    if (m_role == NetworkRole::Host) {
+        announcePresence();
+    }
 }
 
 void NetworkManager::stopDiscovery()
 {
     m_discoveryTimer->stop();
     m_cleanupTimer->stop();
-    m_discoverySocket->close();
+    if (m_discoverySocket->state() != QAbstractSocket::UnconnectedState) {
+        m_discoverySocket->close();
+    }
     m_discoveredPeers.clear();
 }
 
@@ -152,8 +190,31 @@ void NetworkManager::announcePresence()
     obj["type"] = "CHECKERS_GAME";
     obj["name"] = m_playerName;
     obj["port"] = static_cast<int>(m_hostPort);
+    obj["timestamp"] = QDateTime::currentMSecsSinceEpoch();
     
     QByteArray data = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    
+    // Broadcast on all interfaces to ensure discovery works
+    for (const QNetworkInterface& iface : QNetworkInterface::allInterfaces()) {
+        if (!iface.flags().testFlag(QNetworkInterface::IsUp) ||
+            !iface.flags().testFlag(QNetworkInterface::IsRunning) ||
+            iface.flags().testFlag(QNetworkInterface::IsLoopBack)) {
+            continue;
+        }
+        
+        for (const QNetworkAddressEntry& entry : iface.addressEntries()) {
+            if (entry.ip().protocol() != QAbstractSocket::IPv4Protocol) {
+                continue;
+            }
+            
+            QHostAddress broadcast = entry.broadcast();
+            if (!broadcast.isNull()) {
+                m_discoverySocket->writeDatagram(data, broadcast, DISCOVERY_PORT);
+            }
+        }
+    }
+    
+    // Also send to general broadcast address
     m_discoverySocket->writeDatagram(data, QHostAddress::Broadcast, DISCOVERY_PORT);
 }
 
@@ -163,12 +224,21 @@ void NetworkManager::onDiscoveryReadyRead()
         QByteArray datagram;
         datagram.resize(m_discoverySocket->pendingDatagramSize());
         QHostAddress sender;
+        quint16 senderPort;
         
-        m_discoverySocket->readDatagram(datagram.data(), datagram.size(), &sender, nullptr);
+        m_discoverySocket->readDatagram(datagram.data(), datagram.size(), &sender, &senderPort);
+        
+        // Convert to IPv4 if it's an IPv4-mapped IPv6 address
+        if (sender.protocol() == QAbstractSocket::IPv6Protocol) {
+            bool ok;
+            QHostAddress ipv4 = QHostAddress(sender.toIPv4Address(&ok));
+            if (ok) {
+                sender = ipv4;
+            }
+        }
         
         // Ignore our own broadcasts
-        QString localIP = getLocalIPAddress();
-        if (sender.toString() == localIP) {
+        if (m_localAddresses.contains(sender.toString())) {
             continue;
         }
         
@@ -246,11 +316,11 @@ void NetworkManager::onNewConnection()
     m_connected = true;
     m_opponentName = m_socket->peerAddress().toString();
     
-    // Stop accepting new connections by closing and reopening won't work
-    // Instead we just reject additional connections in onNewConnection
-    
     // Start keep-alive
     m_pingTimer->start(5000);
+    
+    // Stop announcing since we have a player
+    m_discoveryTimer->stop();
     
     // Send our player info
     QJsonObject info;
@@ -451,7 +521,11 @@ void NetworkManager::onSocketDisconnected()
         m_socket = nullptr;
     }
     
-    // Server continues accepting connections, we handle rejection in onNewConnection
+    // Resume announcing if still hosting
+    if (m_role == NetworkRole::Host && m_server->isListening()) {
+        m_discoveryTimer->start(DISCOVERY_INTERVAL_MS);
+        announcePresence();
+    }
     
     if (wasConnected) {
         emit opponentDisconnected();
